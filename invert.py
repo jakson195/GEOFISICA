@@ -5,11 +5,11 @@ from mesh import build_mesh, electrode_node
 from forward import solve_potentials_for_sources
 from sensitivity import build_jacobian, node_mask_core
 
-def prepare(path):
+def prepare(path, sub_per_gap=3, nz_layers=20):
     d = parse_res2dinv(path)
     ex_all = [e[0] for rdg in d['readings'] for e in rdg['electrodes']]
     ez_all = [e[1] for rdg in d['readings'] for e in rdg['electrodes']]
-    mesh = build_mesh(ex_all, ez_all)
+    mesh = build_mesh(ex_all, ez_all, sub_per_gap=sub_per_gap, nz=nz_layers)
 
     # eletrodos unicos (posicao x) -> indice
     uniq_x = sorted(set(ex_all))
@@ -55,8 +55,8 @@ def smoothness_matrix(mesh, core_mask):
     return L
 
 
-def run_inversion(path, n_iter=6, n_k=18, verbose=True, progress_cb=None):
-    d, mesh, uniq_x, elec_node_ix = prepare(path)
+def run_inversion(path, n_iter=6, n_k=18, verbose=True, progress_cb=None, sub_per_gap=3, nz_layers=20):
+    d, mesh, uniq_x, elec_node_ix = prepare(path, sub_per_gap=sub_per_gap, nz_layers=nz_layers)
     nx, nz = mesh['nx'], mesh['nz']
     readings = d['readings']
 
