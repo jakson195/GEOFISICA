@@ -630,6 +630,36 @@ if res is not None:
     COLOR_OPTIONS = ["blue", "green", "red", "orange", "purple", "brown", "gray",
                       "cyan", "magenta", "gold", "darkgreen", "navy", "chocolate", "black"]
 
+    def gerar_faixas_res2dinv_style(vmin, vmax, n_bins_alvo=9):
+        """Gera bordas 'bonitas' (padrão 1-2-5, tipo dobrando a cada degrau) cobrindo
+        o intervalo, igual ao estilo de legenda automática do RES2DINV — bem mais
+        granular que 2-3 faixas largas. Cores em degradê azul->vermelho (mesma leitura
+        visual: frio=baixa resistividade, quente=alta)."""
+        import matplotlib.cm as cm
+        import matplotlib.colors as mcolors
+        vmin = max(vmin, 0.5)
+        exp_start = int(np.floor(np.log10(vmin)))
+        exp_end = int(np.ceil(np.log10(vmax)))
+        edges = []
+        for e in range(exp_start, exp_end + 1):
+            for m in (1, 2, 5):
+                v = m * 10.0**e
+                if vmin*0.7 <= v <= vmax*1.3:
+                    edges.append(round(v, 1) if v < 10 else round(v))
+        edges = sorted(set(edges))
+        if len(edges) < 3:
+            edges = list(np.round(np.linspace(vmin, vmax, n_bins_alvo+1), 1))
+        if edges[0] > 0:
+            edges = [0.0] + edges
+        n = len(edges) - 1
+        cmap = matplotlib.colormaps.get_cmap('turbo').resampled(n)
+        rows = []
+        for i in range(n):
+            hexcolor = mcolors.to_hex(cmap(i))
+            rows.append({"De (ohm.m)": edges[i], "Até (ohm.m)": edges[i+1],
+                         "Rótulo": "", "Cor": hexcolor, "Hachura": "nenhuma"})
+        return pd.DataFrame(rows)
+
     if "class_df" not in st.session_state:
         st.session_state["class_df"] = pd.DataFrame([
             {"De (ohm.m)": 0, "Até (ohm.m)": 500, "Rótulo": "Argila saturada", "Cor": "blue", "Hachura": "nenhuma"},
@@ -637,10 +667,22 @@ if res is not None:
             {"De (ohm.m)": 1500, "Até (ohm.m)": 4500, "Rótulo": "Rocha sã", "Cor": "red", "Hachura": "linhas cruzadas"},
         ])
 
+    colgen1, colgen2 = st.columns([1, 3])
+    with colgen1:
+        if st.button("🎨 Gerar faixas automáticas (estilo RES2DINV)"):
+            vmin_data = float(np.nanmin(rho_masked))
+            vmax_data = float(np.nanmax(rho_masked))
+            st.session_state["class_df"] = gerar_faixas_res2dinv_style(vmin_data, vmax_data)
+            st.rerun()
+    with colgen2:
+        st.caption("Cria uma progressão de faixas tipo 60/80/150/300/700/1500... "
+                    "(dobrando a cada degrau, como a legenda padrão do RES2DINV) "
+                    "cobrindo o intervalo real do seu modelo. Edite rótulos/cores livremente depois.")
+
     class_edited = st.data_editor(
         st.session_state["class_df"], num_rows="dynamic", use_container_width=True, key="class_editor",
         column_config={
-            "Cor": st.column_config.SelectboxColumn(options=COLOR_OPTIONS),
+            "Cor": st.column_config.TextColumn(help="Nome (ex: blue, red) ou hex (ex: #1f77b4)"),
             "Hachura": st.column_config.SelectboxColumn(options=list(HATCH_OPTIONS.keys())),
         }
     )
