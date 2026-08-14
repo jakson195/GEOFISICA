@@ -323,6 +323,14 @@ with col5:
         help="Mais camadas = mais detalhe em profundidade, porém mais lento."
     )
 
+robust_weighting = st.checkbox(
+    "Ponderação robusta (reduz automaticamente o peso de leituras ruidosas)", value=True,
+    help="Técnica tipo Huber: pontos com erro muito acima do típico pesam menos na "
+         "inversão a cada iteração, sem precisar excluí-los manualmente. Recomendado "
+         "manter ligado; para os casos mais difíceis, combine com a exclusão manual "
+         "de outliers mais abaixo, depois de rodar."
+)
+
 if "result" not in st.session_state:
     st.session_state["result"] = None
 
@@ -344,7 +352,7 @@ if run_now_path is not None:
     try:
         with st.spinner("Resolvendo modelagem direta e invertendo..."):
             res = run_inversion(tmp_path, n_iter=n_iter, n_k=n_k, verbose=False, progress_cb=cb,
-                                 sub_per_gap=sub_per_gap, nz_layers=nz_layers)
+                                 sub_per_gap=sub_per_gap, nz_layers=nz_layers, robust=robust_weighting)
         st.session_state["result"] = res
         progress_bar.progress(1.0, text="Concluído.")
     except Exception as e:
@@ -373,8 +381,8 @@ if res is not None:
 
     st.subheader("Escala de cores (resistividade)")
     obs_all_tmp = res['obs_rhoa']
-    rho_data_min = float(min(np.nanmin(rho_masked), obs_all_tmp.min()))
-    rho_data_max = float(max(np.nanmax(rho_masked), obs_all_tmp.max()))
+    rho_data_min = float(min(np.nanpercentile(rho_masked, 2), np.percentile(obs_all_tmp, 2)))
+    rho_data_max = float(max(np.nanpercentile(rho_masked, 98), np.percentile(obs_all_tmp, 98)))
     colsc1, colsc2, colsc3 = st.columns([1, 1, 1])
     with colsc1:
         auto_scale = st.checkbox("Escala automática (padrão)", value=True)
@@ -386,10 +394,16 @@ if res is not None:
                                      min_value=0.01, disabled=auto_scale)
 
     if auto_scale:
-        vmin_plot, vmax_plot = None, None
+        vmin_plot = np.log10(max(rho_data_min, 0.01))
+        vmax_plot = np.log10(max(rho_data_max, rho_data_min*1.01))
     else:
         vmin_plot = np.log10(max(vmin_user, 0.01))
         vmax_plot = np.log10(max(vmax_user, vmin_user*1.01))
+    st.caption(
+        "Escala automática usa o intervalo entre os percentis 2% e 98% dos dados "
+        "(evita que 1 ou 2 células extremas, comuns em inversões deste tipo, "
+        "\"esmaguem\" as cores do resto da seção). Ajuste manualmente se preferir outro corte."
+    )
 
     def apply_colorbar_ticks(cbar, vmin_log, vmax_log):
         ticks = list(range(int(np.floor(vmin_log)), int(np.ceil(vmax_log))+1))
@@ -435,13 +449,34 @@ if res is not None:
     st.pyplot(fig_p)
 
     st.subheader("Seção de resistividade invertida")
-    colviz1, colviz2 = st.columns([1, 3])
+    colviz1, colviz2, colviz3 = st.columns([1, 1, 1])
     with colviz1:
         show_isolines = st.checkbox("Mostrar isolinhas", value=False)
         n_isolines = st.slider("Nº de isolinhas", 4, 20, 10, disabled=not show_isolines)
+    with colviz2:
+        chanfrar = st.checkbox("Chanfrar bordas (corta cantos de baixa cobertura)", value=True)
+        chanfro_angulo = st.slider("Ângulo do corte (graus, 45° = padrão)", 20, 70, 45,
+                                    disabled=not chanfrar,
+                                    help="Ângulo a partir da vertical nas bordas. Elimina a área "
+                                         "nos cantos que a malha extrapola/interpola sem cobertura "
+                                         "real de dados dos eletrodos das pontas.")
+    with colviz3:
+        vert_exag = st.slider("Exagero vertical", 0.5, 4.0, 1.0, 0.1,
+                               help="1.0 = escala real (sem distorção). Maior = estica a profundidade visualmente.")
+        fig_width = st.slider("Escala horizontal (largura, pol.)", 6, 20, 11)
 
-    fig, ax = plt.subplots(figsize=(11, 5))
+    fig, ax = plt.subplots(figsize=(fig_width, 5))
     lograho_masked = np.log10(rho_masked)
+
+    if chanfrar:
+        slope = 1.0 / np.tan(np.radians(chanfro_angulo))  # profundidade permitida por metro de afastamento da borda
+        dist_left = Xg - xmin_core
+        dist_right = xmax_core - Xg
+        dist_edge = np.minimum(dist_left, dist_right)
+        depth_grid = surface[None, :] - Zg  # profundidade real de cada no da malha
+        chanfro_mask = depth_grid <= np.maximum(dist_edge, 0) * slope
+        lograho_masked = np.where(chanfro_mask, lograho_masked, np.nan)
+
     vmin_s = vmin_plot if vmin_plot is not None else np.nanmin(lograho_masked)
     vmax_s = vmax_plot if vmax_plot is not None else np.nanmax(lograho_masked)
     pc = ax.pcolormesh(Xg, Zg, lograho_masked, shading='auto', cmap='turbo', vmin=vmin_s, vmax=vmax_s)
@@ -458,6 +493,7 @@ if res is not None:
     ax.set_xlabel('Distância ao longo da linha (m)')
     ax.set_ylabel('Elevação (m)')
     ax.set_title(f"RMS de ajuste (log) = {res['best_rms']:.1f}%")
+    ax.set_aspect(vert_exag)
     ax.legend(loc='lower right')
     plt.tight_layout()
     st.pyplot(fig)
@@ -581,7 +617,7 @@ if res is not None:
             try:
                 with st.spinner(f"Reinvertendo com {len(filtered_readings)} leituras (excluídas {n_marked})..."):
                     res2 = run_inversion(tmp_path2, n_iter=n_iter, n_k=n_k, verbose=False, progress_cb=cb2,
-                                          sub_per_gap=sub_per_gap, nz_layers=nz_layers)
+                                          sub_per_gap=sub_per_gap, nz_layers=nz_layers, robust=robust_weighting)
                 st.session_state["result"] = res2
                 progress_bar2.progress(1.0, text="Concluído.")
                 st.success(f"Novo RMS: {res2['best_rms']:.1f}%  (antes: {res['best_rms']:.1f}%)")

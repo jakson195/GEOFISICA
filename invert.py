@@ -55,7 +55,8 @@ def smoothness_matrix(mesh, core_mask):
     return L
 
 
-def run_inversion(path, n_iter=6, n_k=18, verbose=True, progress_cb=None, sub_per_gap=3, nz_layers=20):
+def run_inversion(path, n_iter=6, n_k=18, verbose=True, progress_cb=None, sub_per_gap=3, nz_layers=20,
+                   robust=True):
     d, mesh, uniq_x, elec_node_ix = prepare(path, sub_per_gap=sub_per_gap, nz_layers=nz_layers)
     nx, nz = mesh['nx'], mesh['nz']
     readings = d['readings']
@@ -105,8 +106,25 @@ def run_inversion(path, n_iter=6, n_k=18, verbose=True, progress_cb=None, sub_pe
             best_log_rho = log_rho.copy()
             best_R_pred = R_pred.copy()
 
-        JTJ = J.T @ J
-        JTr = J.T @ resid
+        # ponderacao robusta (IRLS, tipo Huber): pontos com residuo muito acima do
+        # espalhamento tipico dos dados ganham peso menor na atualizacao do modelo,
+        # em vez de arrastar a inversao inteira na direcao deles. É o analogo do que
+        # softwares comerciais chamam de "inversão robusta" — reduz a necessidade de
+        # excluir manualmente leituras ruidosas.
+        if robust:
+            med = np.median(resid)
+            mad = np.median(np.abs(resid - med))
+            scale = max(mad * 1.4826, 1e-6)
+            c = 1.0 * scale
+            w = np.ones_like(resid)
+            absres = np.abs(resid)
+            out = absres > c
+            w[out] = c / absres[out]
+        else:
+            w = np.ones_like(resid)
+
+        JTJ = J.T @ (w[:, None] * J)
+        JTr = J.T @ (w * resid)
         LTL = (L.T @ L).toarray()
 
         if lam is None:
