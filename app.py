@@ -4,6 +4,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 import tempfile, os, io, csv
 
 from invert import run_inversion
@@ -406,11 +407,20 @@ if res is not None:
     )
 
     def apply_colorbar_ticks(cbar, vmin_log, vmax_log):
-        ticks = list(range(int(np.floor(vmin_log)), int(np.ceil(vmax_log))+1))
+        vmin, vmax = 10**vmin_log, 10**vmax_log
+        exp_start = int(np.floor(np.log10(vmin)))
+        exp_end = int(np.ceil(np.log10(vmax)))
+        ticks = []
+        for e in range(exp_start, exp_end + 1):
+            for m in (1, 2, 5):
+                v = m * 10.0**e
+                if vmin * 0.98 <= v <= vmax * 1.02:
+                    ticks.append(v)
+        ticks = sorted(set(ticks))
         if len(ticks) < 2:
-            ticks = np.linspace(vmin_log, vmax_log, 5)
-        cbar.set_ticks(ticks)
-        cbar.set_ticklabels([f"{10**t:.0f}" for t in ticks])
+            ticks = list(np.logspace(vmin_log, vmax_log, 5))
+        cbar.set_ticks([np.log10(t) for t in ticks])
+        cbar.set_ticklabels([f"{t:,.0f}" if t >= 1 else f"{t:.2f}" for t in ticks])
 
     def pseudo_coords(readings):
         """Pseudo-posicao (x,z) de cada leitura p/ visualizar os dados brutos:
@@ -465,6 +475,15 @@ if res is not None:
                                help="1.0 = escala real (sem distorção). Maior = estica a profundidade visualmente.")
         fig_width = st.slider("Escala horizontal (largura, pol.)", 6, 20, 11)
 
+    st.markdown("**Faixa de elevação exibida** (o RES2DINV costuma mostrar uma faixa mais rasa que a malha calculada):")
+    colel1, colel2 = st.columns(2)
+    elev_default_top = float(surface.max()) + 3
+    elev_default_bottom = float(surface.min() - mesh['depth_max'])
+    with colel1:
+        elev_top = st.number_input("Elevação máxima (topo, m)", value=round(elev_default_top, 1))
+    with colel2:
+        elev_bottom = st.number_input("Elevação mínima (base, m)", value=round(elev_default_bottom, 1))
+
     fig, ax = plt.subplots(figsize=(fig_width, 5))
     lograho_masked = np.log10(rho_masked)
 
@@ -489,7 +508,7 @@ if res is not None:
     elev_e = [surface[np.argmin(np.abs(xs-x))] for x in uniq_x]
     ax.scatter(uniq_x, elev_e, marker='v', color='k', s=25, zorder=5, label='Eletrodos')
     ax.set_xlim(xmin_core, xmax_core)
-    ax.set_ylim(surface.min()-mesh['depth_max'], surface.max()+3)
+    ax.set_ylim(elev_bottom, elev_top)
     ax.set_xlabel('Distância ao longo da linha (m)')
     ax.set_ylabel('Elevação (m)')
     ax.set_title(f"RMS de ajuste (log) = {res['best_rms']:.1f}%")
@@ -501,6 +520,144 @@ if res is not None:
     buf_png = io.BytesIO()
     fig.savefig(buf_png, format='png', dpi=150)
     st.download_button("Baixar seção (PNG)", buf_png.getvalue(), file_name="secao_resistividade.png", mime="image/png")
+
+    st.subheader("Classificação por faixas / Seção interpretativa geológica")
+    st.caption(
+        "Defina faixas de resistividade com cor e (opcionalmente) uma classificação "
+        "geológica/geotécnica para cada uma. Usado para colorir a seção em faixas "
+        "discretas (em vez de escala contínua) e para gerar uma seção interpretativa "
+        "com hachuras, pronta para relatório."
+    )
+
+    HATCH_OPTIONS = {
+        "nenhuma": "", "pontos": ".", "linhas diagonais": "/", "linhas diagonais (inv.)": "\\",
+        "linhas cruzadas": "x", "linhas horizontais": "-", "linhas verticais": "|",
+        "tijolo": "+", "círculos": "o", "estrelas": "*",
+    }
+    COLOR_OPTIONS = ["blue", "green", "red", "orange", "purple", "brown", "gray",
+                      "cyan", "magenta", "gold", "darkgreen", "navy", "chocolate", "black"]
+
+    if "class_df" not in st.session_state:
+        st.session_state["class_df"] = pd.DataFrame([
+            {"De (ohm.m)": 0, "Até (ohm.m)": 500, "Rótulo": "Argila saturada", "Cor": "blue", "Hachura": "nenhuma"},
+            {"De (ohm.m)": 500, "Até (ohm.m)": 1500, "Rótulo": "Rocha alterada", "Cor": "green", "Hachura": "linhas diagonais"},
+            {"De (ohm.m)": 1500, "Até (ohm.m)": 4500, "Rótulo": "Rocha sã", "Cor": "red", "Hachura": "linhas cruzadas"},
+        ])
+
+    class_edited = st.data_editor(
+        st.session_state["class_df"], num_rows="dynamic", use_container_width=True, key="class_editor",
+        column_config={
+            "Cor": st.column_config.SelectboxColumn(options=COLOR_OPTIONS),
+            "Hachura": st.column_config.SelectboxColumn(options=list(HATCH_OPTIONS.keys())),
+        }
+    )
+    st.session_state["class_df"] = class_edited
+    class_df_valid = class_edited.dropna(subset=["De (ohm.m)", "Até (ohm.m)", "Cor"]).sort_values("De (ohm.m)")
+
+    colcl1, colcl2, colcl3 = st.columns(3)
+    with colcl1:
+        usar_classificado = st.checkbox("Colorir a seção principal com estas faixas (em vez de escala contínua)", value=False)
+    with colcl2:
+        gerar_interpretativa = st.checkbox("Gerar seção interpretativa com hachuras (para relatório)", value=False)
+    with colcl3:
+        suavizar = st.checkbox("Suavizar contornos (interpolação)", value=True,
+                                help="Interpola a malha para uma grade mais fina só para desenho — "
+                                     "deixa as bordas entre classes com curvas suaves em vez de "
+                                     "seguir o contorno em degraus das células da malha de cálculo. "
+                                     "Não altera o modelo, só a exibição.")
+
+    def build_fine_grid(mesh, log_rho_full, xmin_core, xmax_core, n_x=320, n_z=160):
+        from scipy.interpolate import RectBivariateSpline
+        xs_, depths_ = mesh['xs'], mesh['depths']
+        # interpolação BIlinear (kx=ky=1): spline cúbica "dispara" (overshoot) perto de
+        # células isoladas com valor extremo, comuns nesse tipo de inversão — linear evita isso
+        spline = RectBivariateSpline(depths_, xs_, log_rho_full, kx=1, ky=1)
+        xs_fine = np.linspace(xmin_core, xmax_core, n_x)
+        depth_max_plot = mesh['depth_max']
+        depths_fine = np.linspace(0, depth_max_plot, n_z)
+        logrho_fine = spline(depths_fine, xs_fine)
+        # limite de seguranca: nunca extrapolar alem do range real do modelo
+        logrho_fine = np.clip(logrho_fine, log_rho_full.min(), log_rho_full.max())
+        surface_fine = np.interp(xs_fine, xs_, mesh['surface'])
+        Dg_fine = np.meshgrid(xs_fine, depths_fine)[1]
+        Xg_fine = np.meshgrid(xs_fine, depths_fine)[0]
+        Zg_fine = surface_fine[None, :] - Dg_fine
+        return Xg_fine, Zg_fine, Dg_fine, logrho_fine, xs_fine, depths_fine, surface_fine
+
+    if len(class_df_valid) >= 1:
+        bounds = sorted(set(class_df_valid["De (ohm.m)"].tolist() + class_df_valid["Até (ohm.m)"].tolist()))
+        cores_lista = class_df_valid["Cor"].tolist()
+        rotulos_lista = class_df_valid["Rótulo"].fillna("").tolist()
+        hachuras_lista = [HATCH_OPTIONS.get(h, "") for h in class_df_valid["Hachura"].tolist()]
+
+        if suavizar:
+            Xg_plot, Zg_plot, Dg_plot, logrho_plot, xs_p, depths_p, surface_p = build_fine_grid(
+                mesh, log_rho, xmin_core, xmax_core)
+            rho_plot_base = np.exp(logrho_plot)  # log_rho é log NATURAL (ln), não log10
+            if chanfrar:
+                slope_p = 1.0 / np.tan(np.radians(chanfro_angulo))
+                dist_edge_p = np.minimum(Xg_plot - xmin_core, xmax_core - Xg_plot)
+                chanfro_mask_p = Dg_plot <= np.maximum(dist_edge_p, 0) * slope_p
+                rho_plot_base = np.where(chanfro_mask_p, rho_plot_base, np.nan)
+        else:
+            Xg_plot, Zg_plot = Xg, Zg
+            rho_plot_base = np.where(chanfro_mask, rho_masked, np.nan) if chanfrar else rho_masked
+
+        if usar_classificado:
+            import matplotlib.colors as mcolors
+            cmap_classes = mcolors.ListedColormap(cores_lista)
+            norm_classes = mcolors.BoundaryNorm(bounds, cmap_classes.N, clip=True)
+
+            fig_c, ax_c = plt.subplots(figsize=(fig_width, 5))
+            ax_c.pcolormesh(Xg_plot, Zg_plot, rho_plot_base, shading='gouraud' if suavizar else 'auto',
+                             cmap=cmap_classes, norm=norm_classes)
+            ax_c.scatter(uniq_x, elev_e, marker='v', color='k', s=25, zorder=5, label='Eletrodos')
+            ax_c.set_xlim(xmin_core, xmax_core)
+            ax_c.set_ylim(elev_bottom, elev_top)
+            ax_c.set_xlabel('Distância ao longo da linha (m)')
+            ax_c.set_ylabel('Elevação (m)')
+            ax_c.set_aspect(vert_exag)
+            legend_patches = [mpatches.Patch(
+                facecolor=c, label=f"{r if r else ''} ({b0:.0f}–{b1:.0f} ohm.m)".strip())
+                for c, r, b0, b1 in zip(cores_lista, rotulos_lista,
+                                         class_df_valid["De (ohm.m)"], class_df_valid["Até (ohm.m)"])]
+            ax_c.legend(handles=legend_patches, loc='lower right', fontsize=8)
+            ax_c.set_title("Seção classificada por faixas")
+            plt.tight_layout()
+            st.pyplot(fig_c)
+            buf_c = io.BytesIO()
+            fig_c.savefig(buf_c, format='png', dpi=150)
+            st.download_button("Baixar seção classificada (PNG)", buf_c.getvalue(),
+                                file_name="secao_classificada.png", mime="image/png")
+
+        if gerar_interpretativa:
+            rho_clipped = np.clip(rho_plot_base, bounds[0], bounds[-1] * 0.999999)
+            rho_clipped = np.ma.masked_invalid(rho_clipped)
+            fig_i, ax_i = plt.subplots(figsize=(fig_width, 5))
+            cs_i = ax_i.contourf(Xg_plot, Zg_plot, rho_clipped,
+                                  levels=bounds, colors=cores_lista, hatches=hachuras_lista, extend='neither')
+            for coll in cs_i.collections if hasattr(cs_i, 'collections') else []:
+                coll.set_edgecolor('black')
+                coll.set_linewidth(0.0)
+            ax_i.scatter(uniq_x, elev_e, marker='v', color='k', s=25, zorder=5, label='Eletrodos')
+            ax_i.set_xlim(xmin_core, xmax_core)
+            ax_i.set_ylim(elev_bottom, elev_top)
+            ax_i.set_xlabel('Distância ao longo da linha (m)')
+            ax_i.set_ylabel('Elevação (m)')
+            ax_i.set_aspect(vert_exag)
+            legend_patches_i = [mpatches.Patch(
+                facecolor=c, hatch=h, edgecolor='black',
+                label=f"{r if r else ''} ({b0:.0f}–{b1:.0f} ohm.m)".strip())
+                for c, h, r, b0, b1 in zip(cores_lista, hachuras_lista, rotulos_lista,
+                                            class_df_valid["De (ohm.m)"], class_df_valid["Até (ohm.m)"])]
+            ax_i.legend(handles=legend_patches_i, loc='lower right', fontsize=8)
+            ax_i.set_title("Seção interpretativa (classificação geológica)")
+            plt.tight_layout()
+            st.pyplot(fig_i)
+            buf_i = io.BytesIO()
+            fig_i.savefig(buf_i, format='png', dpi=200)
+            st.download_button("Baixar seção interpretativa (PNG, p/ relatório)", buf_i.getvalue(),
+                                file_name="secao_interpretativa.png", mime="image/png")
 
     colA, colB = st.columns(2)
 
