@@ -341,6 +341,19 @@ depth_weight_power = st.slider(
          "bordas, em profundidade) continuam sendo mal restringidas por natureza: nem "
          "o RES2DINV nem este app têm como 'adivinhar' o que os dados não enxergam."
 )
+metodo_inversao = st.radio(
+    "Método de otimização",
+    ["Gauss-Newton completo", "Quasi-Newton (Jacobiano aproximado)"],
+    horizontal=True,
+    help="Gauss-Newton completo: recalcula a sensibilidade (Jacobiano) inteira a cada "
+         "iteração — mais preciso, cada passo é mais informativo. "
+         "Quasi-Newton: calcula o Jacobiano completo só na 1ª iteração e depois atualiza "
+         "aproximadamente (fórmula de Broyden), sem refazer o cálculo de sensibilidade "
+         "completo — mais rápido por iteração, porém converge de forma menos precisa "
+         "(pode precisar de mais iterações para o mesmo resultado). É o mesmo par de "
+         "opções que o RES2DINV oferece."
+)
+inversion_method = 'quasi_newton' if metodo_inversao.startswith("Quasi") else 'gauss_newton'
 
 if "result" not in st.session_state:
     st.session_state["result"] = None
@@ -364,7 +377,7 @@ if run_now_path is not None:
         with st.spinner("Resolvendo modelagem direta e invertendo..."):
             res = run_inversion(tmp_path, n_iter=n_iter, n_k=n_k, verbose=False, progress_cb=cb,
                                  sub_per_gap=sub_per_gap, nz_layers=nz_layers, robust=robust_weighting,
-                                 depth_weight_power=depth_weight_power)
+                                 depth_weight_power=depth_weight_power, method=inversion_method)
         st.session_state["result"] = res
         progress_bar.progress(1.0, text="Concluído.")
     except Exception as e:
@@ -857,7 +870,7 @@ if res is not None:
                 with st.spinner(f"Reinvertendo com {len(filtered_readings)} leituras (excluídas {n_marked})..."):
                     res2 = run_inversion(tmp_path2, n_iter=n_iter, n_k=n_k, verbose=False, progress_cb=cb2,
                                           sub_per_gap=sub_per_gap, nz_layers=nz_layers, robust=robust_weighting,
-                                          depth_weight_power=depth_weight_power)
+                                          depth_weight_power=depth_weight_power, method=inversion_method)
                 st.session_state["result"] = res2
                 progress_bar2.progress(1.0, text="Concluído.")
                 st.success(f"Novo RMS: {res2['best_rms']:.1f}%  (antes: {res['best_rms']:.1f}%)")

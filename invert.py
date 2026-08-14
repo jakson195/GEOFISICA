@@ -3,7 +3,7 @@ import time
 from parser import parse_res2dinv, geometric_factor
 from mesh import build_mesh, electrode_node
 from forward import solve_potentials_for_sources
-from sensitivity import build_jacobian, node_mask_core
+from sensitivity import build_jacobian, compute_R_pred, node_mask_core
 
 def prepare(path, sub_per_gap=3, nz_layers=20):
     d = parse_res2dinv(path)
@@ -64,7 +64,7 @@ def smoothness_matrix(mesh, core_mask, depth_weight_power=0.0, depth_weight_d0=3
 
 
 def run_inversion(path, n_iter=6, n_k=18, verbose=True, progress_cb=None, sub_per_gap=3, nz_layers=20,
-                   robust=True, depth_weight_power=0.0):
+                   robust=True, depth_weight_power=0.0, method='gauss_newton'):
     d, mesh, uniq_x, elec_node_ix = prepare(path, sub_per_gap=sub_per_gap, nz_layers=nz_layers)
     nx, nz = mesh['nx'], mesh['nz']
     readings = d['readings']
@@ -97,6 +97,9 @@ def run_inversion(path, n_iter=6, n_k=18, verbose=True, progress_cb=None, sub_pe
     best_rms = np.inf
     best_log_rho = log_rho.copy()
     t_start = time.time()
+    J = None
+    ln_Rpred_prev = None
+    dm_prev = None
     for it in range(n_iter):
         sigma_nodes = np.exp(-log_rho)
         # eletrodos unicos: os nos de superficie correspondentes a cada eletrodo
@@ -104,7 +107,20 @@ def run_inversion(path, n_iter=6, n_k=18, verbose=True, progress_cb=None, sub_pe
         pots = solve_potentials_for_sources(mesh, sigma_nodes, src_nodes, n_k=n_k)
         phi_fields = np.array([pots[s].reshape(nz, nx) for s in src_nodes])
 
-        J, R_pred, _ = build_jacobian(readings, elec_node_ix, phi_fields, sigma_nodes, mesh, core_mask)
+        use_full_jacobian = (method == 'gauss_newton') or (J is None)
+        if use_full_jacobian:
+            J, R_pred, _ = build_jacobian(readings, elec_node_ix, phi_fields, sigma_nodes, mesh, core_mask)
+        else:
+            # Quasi-Newton: nao recalcula a sensibilidade completa — atualiza o
+            # Jacobiano aproximadamente (formula de Broyden, rank-1) a partir da
+            # variacao real da resposta prevista entre esta iteracao e a anterior.
+            R_pred = compute_R_pred(readings, phi_fields)
+            ln_Rpred_now = np.log(np.abs(R_pred))
+            dF = ln_Rpred_now - ln_Rpred_prev
+            denom = float(dm_prev @ dm_prev) + 1e-12
+            J = J + np.outer(dF - J @ dm_prev, dm_prev) / denom
+
+        ln_Rpred_prev = np.log(np.abs(R_pred))
 
         resid = np.log(obs_R) - np.log(np.abs(R_pred))
         rms = 100*np.sqrt(np.mean(resid**2))
@@ -142,7 +158,8 @@ def run_inversion(path, n_iter=6, n_k=18, verbose=True, progress_cb=None, sub_pe
             lam_min = 0.3 * ratio
 
         if verbose:
-            print(f"iter {it}: RMS(log)={rms:.2f}%   lambda={lam:.3e}   t={time.time()-t_start:.1f}s")
+            jtag = "J completo" if use_full_jacobian else "J~Broyden"
+            print(f"iter {it} [{jtag}]: RMS(log)={rms:.2f}%   lambda={lam:.3e}   t={time.time()-t_start:.1f}s")
         if progress_cb:
             progress_cb(it, n_iter, rms)
 
@@ -161,6 +178,7 @@ def run_inversion(path, n_iter=6, n_k=18, verbose=True, progress_cb=None, sub_pe
         if maxabs > step_limit:
             dm = dm * (step_limit/maxabs)
         log_rho.ravel()[core_idx] += dm
+        dm_prev = dm.copy()
         lam = max(lam*0.55, lam_min)
 
     return {

@@ -42,6 +42,21 @@ def lump_cell_to_nodes(cellmap, nz, nx):
     return node
 
 
+def compute_R_pred(readings, phi_fields):
+    """Versao leve: so a resposta prevista (sem sensibilidade). Usada no modo
+    Quasi-Newton, que reaproveita o Jacobiano por atualização aproximada
+    (Broyden) em vez de recalcular a sensibilidade completa a cada iteração."""
+    n_data = len(readings)
+    R_pred = np.zeros(n_data)
+    for d, rdg in enumerate(readings):
+        iC1, iC2, iP1, iP2 = rdg['enode']
+        Vfield = phi_fields[iC1] - phi_fields[iC2]
+        jP1, iP1n = rdg['node_ix'][2]
+        jP2, iP2n = rdg['node_ix'][3]
+        R_pred[d] = Vfield[jP1, iP1n] - Vfield[jP2, iP2n]
+    return R_pred
+
+
 def build_jacobian(readings, elec_node_ix, phi_fields, sigma_nodes, mesh, core_mask):
     """
     readings: lista de dicts com 'electrodes' (x,z) e chave auxiliar 'enode' (indices dos 4 eletrodos na lista unica)
