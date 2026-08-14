@@ -5,6 +5,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import plotly.graph_objects as go
 import tempfile, os, io, csv
 
 from invert import run_inversion
@@ -331,6 +332,15 @@ robust_weighting = st.checkbox(
          "manter ligado; para os casos mais difíceis, combine com a exclusão manual "
          "de outliers mais abaixo, depois de rodar."
 )
+depth_weight_power = st.slider(
+    "Peso de profundidade (relaxa a suavidade em zonas profundas/pouco sensíveis)",
+    0.0, 2.0, 0.0, 0.25,
+    help="0 = padrão (suavidade igual em toda a malha). Valores maiores permitem mais "
+         "contraste em regiões profundas onde os dados têm pouca sensibilidade — em "
+         "geral melhora o RMS, mas region\u00f5es de baixa cobertura de dados (perto das "
+         "bordas, em profundidade) continuam sendo mal restringidas por natureza: nem "
+         "o RES2DINV nem este app têm como 'adivinhar' o que os dados não enxergam."
+)
 
 if "result" not in st.session_state:
     st.session_state["result"] = None
@@ -353,7 +363,8 @@ if run_now_path is not None:
     try:
         with st.spinner("Resolvendo modelagem direta e invertendo..."):
             res = run_inversion(tmp_path, n_iter=n_iter, n_k=n_k, verbose=False, progress_cb=cb,
-                                 sub_per_gap=sub_per_gap, nz_layers=nz_layers, robust=robust_weighting)
+                                 sub_per_gap=sub_per_gap, nz_layers=nz_layers, robust=robust_weighting,
+                                 depth_weight_power=depth_weight_power)
         st.session_state["result"] = res
         progress_bar.progress(1.0, text="Concluído.")
     except Exception as e:
@@ -379,6 +390,37 @@ if res is not None:
     uniq_x = res['uniq_x']
     xmin_core = min(uniq_x) - mesh['spacing']
     xmax_core = max(uniq_x) + mesh['spacing']
+    x_ref = min(uniq_x)  # posicao do 1o eletrodo = referencia da estaca inicial
+
+    # estado de exclusao de leituras: unico, compartilhado entre clique nos graficos
+    # e a tabela de exclusao manual. Reinicia quando um novo resultado é carregado.
+    if st.session_state.get("excl_for_id") != id(res):
+        st.session_state["excluded_idx"] = set()
+        st.session_state["excl_for_id"] = id(res)
+
+    st.subheader("Nomenclatura de estacas")
+    colest1, colest2 = st.columns(2)
+    with colest1:
+        estaca_espac = st.number_input("Espaçamento entre estacas (m)", value=20.0, min_value=0.1, step=1.0)
+    with colest2:
+        estaca_inicial = st.number_input("Nome da estaca inicial (nº)", value=0, step=1,
+                                          help="Ex.: se o primeiro eletrodo deve se chamar EST 20, "
+                                               "digite 20 aqui — a sequência (21, 22, ...) segue automática.")
+
+    def estaca_num(x):
+        return int(round(estaca_inicial + (x - x_ref) / estaca_espac))
+
+    def add_estaca_axis(ax, xmin, xmax):
+        ax_top = ax.secondary_xaxis('top')
+        first_tick = x_ref + estaca_espac * np.floor((xmin - x_ref) / estaca_espac)
+        ticks = np.arange(first_tick, xmax + estaca_espac, estaca_espac)
+        ticks = ticks[(ticks >= xmin) & (ticks <= xmax)]
+        if len(ticks) == 0:
+            return ax_top
+        labels = [f"EST {estaca_num(t)}" for t in ticks]
+        ax_top.set_xticks(ticks)
+        ax_top.set_xticklabels(labels, rotation=45, fontsize=7)
+        return ax_top
 
     st.subheader("Escala de cores (resistividade)")
     obs_all_tmp = res['obs_rhoa']
@@ -434,29 +476,66 @@ if res is not None:
             pz.append(-(max(elec_x)-min(elec_x))*0.35)
         return np.array(px), np.array(pz)
 
+    def interactive_pseudo_section(px, pz, color_vals, color_label, hover_extra, key, colorscale='turbo'):
+        """Pseudo-secao interativa (Plotly): clique/selecione (retangulo ou laço, no
+        menu da direita do gráfico) para marcar leituras a excluir. Pontos já marcados
+        aparecem com X preto por cima."""
+        excl = st.session_state["excluded_idx"]
+        n = len(px)
+        estacas_hover = [f"EST {estaca_num(x)}" for x in px]
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=px, y=pz, mode='markers',
+            marker=dict(size=13, color=color_vals, colorscale=colorscale,
+                        colorbar=dict(title=color_label), line=dict(width=1, color='black')),
+            customdata=np.stack([np.arange(n), estacas_hover, hover_extra], axis=1),
+            hovertemplate="%{customdata[1]}<br>x=%{x:.1f} m<br>" + color_label + "=%{customdata[2]}<extra></extra>",
+            name="leituras",
+        ))
+        if excl:
+            idxs = [i for i in excl if i < n]
+            if idxs:
+                fig.add_trace(go.Scatter(
+                    x=px[idxs], y=pz[idxs], mode='markers',
+                    marker=dict(size=16, symbol='x-thin', line=dict(width=3, color='black')),
+                    name="excluído", hoverinfo='skip'
+                ))
+        fig.update_layout(
+            height=320, margin=dict(l=10, r=10, t=10, b=10),
+            xaxis_title="Distância ao longo da linha (m)", yaxis_title="Pseudo-profundidade",
+            yaxis=dict(showticklabels=False), dragmode='select',
+            showlegend=False,
+        )
+        event = st.plotly_chart(fig, on_select="rerun", selection_mode=("points", "box", "lasso"),
+                                 key=key, use_container_width=True)
+        try:
+            points = event.selection.points if hasattr(event, "selection") else event.get("selection", {}).get("points", [])
+        except Exception:
+            points = []
+        if points:
+            for pt in points:
+                pidx = pt.get("customdata", [None])[0] if isinstance(pt, dict) else None
+                if pidx is None and isinstance(pt, dict):
+                    pidx = pt.get("point_index")
+                if pidx is not None:
+                    st.session_state["excluded_idx"].add(int(pidx))
+
     st.subheader("Pseudo-seção dos dados observados")
     st.caption(
         "Visualização espacial dos pontos medidos em campo (posição × profundidade "
-        "aproximada), coloridos pela resistividade aparente observada — antes da inversão."
+        "aproximada), coloridos pela resistividade aparente observada — antes da inversão. "
+        "**Clique num ponto (ou use o laço/retângulo de seleção) para marcar como ruído/excluir.**"
     )
     px, pz = pseudo_coords(res['readings'])
     obs_all = res['obs_rhoa']
-    log_obs = np.log10(obs_all)
-    vmin_p = vmin_plot if vmin_plot is not None else log_obs.min()
-    vmax_p = vmax_plot if vmax_plot is not None else log_obs.max()
-    fig_p, ax_p = plt.subplots(figsize=(11, 3.2))
-    sc = ax_p.scatter(px, pz, c=log_obs, cmap='turbo', s=60, edgecolors='k', linewidths=0.3,
-                       vmin=vmin_p, vmax=vmax_p)
-    cbar_p = fig_p.colorbar(sc, ax=ax_p, label='Resistividade aparente (ohm.m)')
-    apply_colorbar_ticks(cbar_p, vmin_p, vmax_p)
-    elev_e = [surface[np.argmin(np.abs(xs-x))] for x in uniq_x]
-    ax_p.scatter(uniq_x, [0]*len(uniq_x), marker='v', color='k', s=20, zorder=5)
-    ax_p.set_xlim(xmin_core, xmax_core)
-    ax_p.set_xlabel('Distância ao longo da linha (m)')
-    ax_p.set_ylabel('Pseudo-profundidade (m)')
-    ax_p.set_yticklabels([])
-    plt.tight_layout()
-    st.pyplot(fig_p)
+    interactive_pseudo_section(
+        px, pz, obs_all, "Resistividade (ohm.m)",
+        hover_extra=[f"{v:.1f} ohm.m" for v in obs_all], key="obs_pseudo_plotly"
+    )
+    n_excl_now = len(st.session_state["excluded_idx"])
+    if n_excl_now:
+        st.caption(f"🔴 {n_excl_now} leitura(s) marcada(s) para exclusão (veja/edite a lista completa "
+                    "na seção 'Identificar e excluir pontos com ruído', mais abaixo).")
 
     st.subheader("Seção de resistividade invertida")
     colviz1, colviz2, colviz3 = st.columns([1, 1, 1])
@@ -514,6 +593,7 @@ if res is not None:
     ax.set_title(f"RMS de ajuste (log) = {res['best_rms']:.1f}%")
     ax.set_aspect(vert_exag)
     ax.legend(loc='lower right')
+    add_estaca_axis(ax, xmin_core, xmax_core)
     plt.tight_layout()
     st.pyplot(fig)
 
@@ -623,6 +703,7 @@ if res is not None:
                                          class_df_valid["De (ohm.m)"], class_df_valid["Até (ohm.m)"])]
             ax_c.legend(handles=legend_patches, loc='lower right', fontsize=8)
             ax_c.set_title("Seção classificada por faixas")
+            add_estaca_axis(ax_c, xmin_core, xmax_core)
             plt.tight_layout()
             st.pyplot(fig_c)
             buf_c = io.BytesIO()
@@ -652,6 +733,7 @@ if res is not None:
                                             class_df_valid["De (ohm.m)"], class_df_valid["Até (ohm.m)"])]
             ax_i.legend(handles=legend_patches_i, loc='lower right', fontsize=8)
             ax_i.set_title("Seção interpretativa (classificação geológica)")
+            add_estaca_axis(ax_i, xmin_core, xmax_core)
             plt.tight_layout()
             st.pyplot(fig_i)
             buf_i = io.BytesIO()
@@ -714,7 +796,7 @@ if res is not None:
     for idx, r in enumerate(res['readings']):
         (c1, _), (c2, _), (p1, _), (p2, _) = r['electrodes']
         diag_rows.append({
-            "Excluir": False,
+            "Excluir": idx in st.session_state["excluded_idx"],
             "#": idx,
             "C1 (m)": c1, "C2 (m)": c2, "P1 (m)": p1, "P2 (m)": p2,
             "Observado (ohm.m)": round(obs[idx], 1),
@@ -724,20 +806,14 @@ if res is not None:
         })
     diag_df = pd.DataFrame(diag_rows).sort_values("Erro |log| (%)", ascending=False).reset_index(drop=True)
 
-    st.markdown("**Onde estão os pontos com mais ruído (pseudo-seção do erro):**")
+    st.markdown("**Onde estão os pontos com mais ruído (pseudo-seção do erro):** "
+                 "clique num ponto (ou use o laço/retângulo) para marcar como ruído.")
     px_d, pz_d = pseudo_coords(res['readings'])
-    fig_e, ax_e = plt.subplots(figsize=(11, 3.2))
-    sc_e = ax_e.scatter(px_d, pz_d, c=log_err_pct, cmap='Reds', s=70, edgecolors='k', linewidths=0.3,
-                         vmin=0, vmax=max(log_err_pct.max(), 1))
-    fig_e.colorbar(sc_e, ax=ax_e, label='Erro |log| (%)')
-    ax_e.scatter(uniq_x, [0]*len(uniq_x), marker='v', color='k', s=20, zorder=5)
-    ax_e.set_xlim(xmin_core, xmax_core)
-    ax_e.set_xlabel('Distância ao longo da linha (m)')
-    ax_e.set_ylabel('Pseudo-profundidade (m)')
-    ax_e.set_yticklabels([])
-    plt.tight_layout()
-    st.pyplot(fig_e)
-    st.caption("Pontos mais vermelhos e escuros = maior discrepância entre observado e previsto.")
+    interactive_pseudo_section(
+        px_d, pz_d, log_err_pct, "Erro |log| (%)",
+        hover_extra=[f"{v:.1f}%" for v in log_err_pct], key="err_pseudo_plotly", colorscale='Reds'
+    )
+    st.caption("Pontos mais vermelhos/escuros = maior discrepância entre observado e previsto.")
 
     colx1, colx2 = st.columns([1, 2])
     with colx1:
@@ -745,16 +821,22 @@ if res is not None:
                                  max_value=len(diag_df), value=0, step=1)
     if top_n > 0:
         worst_idx = set(diag_df.sort_values("Erro |log| (%)", ascending=False).head(top_n)["#"])
-        diag_df["Excluir"] = diag_df["#"].isin(worst_idx)
+        st.session_state["excluded_idx"].update(worst_idx)
+        diag_df["Excluir"] = diag_df["#"].isin(st.session_state["excluded_idx"])
 
     edited_diag = st.data_editor(
         diag_df, use_container_width=True, hide_index=True, key="diag_editor",
         disabled=["#", "C1 (m)", "C2 (m)", "P1 (m)", "P2 (m)", "Observado (ohm.m)",
                   "Previsto (ohm.m)", "Erro (%)", "Erro |log| (%)"],
     )
+    # tabela é a fonte definitiva apos edicao manual (permite tambem DESmarcar)
+    st.session_state["excluded_idx"] = set(edited_diag.loc[edited_diag["Excluir"], "#"])
 
-    n_marked = int(edited_diag["Excluir"].sum())
+    n_marked = len(st.session_state["excluded_idx"])
     st.caption(f"{n_marked} de {len(edited_diag)} leituras marcadas para exclusão.")
+    if st.button("Limpar todas as marcações"):
+        st.session_state["excluded_idx"] = set()
+        st.rerun()
 
     if st.button("Re-rodar inversão sem os pontos marcados", disabled=n_marked == 0):
         keep_ids = set(edited_diag.loc[~edited_diag["Excluir"], "#"])
@@ -774,7 +856,8 @@ if res is not None:
             try:
                 with st.spinner(f"Reinvertendo com {len(filtered_readings)} leituras (excluídas {n_marked})..."):
                     res2 = run_inversion(tmp_path2, n_iter=n_iter, n_k=n_k, verbose=False, progress_cb=cb2,
-                                          sub_per_gap=sub_per_gap, nz_layers=nz_layers, robust=robust_weighting)
+                                          sub_per_gap=sub_per_gap, nz_layers=nz_layers, robust=robust_weighting,
+                                          depth_weight_power=depth_weight_power)
                 st.session_state["result"] = res2
                 progress_bar2.progress(1.0, text="Concluído.")
                 st.success(f"Novo RMS: {res2['best_rms']:.1f}%  (antes: {res['best_rms']:.1f}%)")

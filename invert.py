@@ -28,14 +28,18 @@ def prepare(path, sub_per_gap=3, nz_layers=20):
     return d, mesh, uniq_x, elec_node_ix
 
 
-def smoothness_matrix(mesh, core_mask):
-    """matriz de rugosidade (diferencas 1a ordem horiz+vert) nos nos do core."""
+def smoothness_matrix(mesh, core_mask, depth_weight_power=0.0, depth_weight_d0=3.0):
+    """matriz de rugosidade (diferencas 1a ordem horiz+vert) nos nos do core.
+    depth_weight_power > 0: reduz o peso da suavidade com a profundidade
+    (padrao usado em inversao de potencial/DC pra compensar a sensibilidade
+    naturalmente menor em profundidade, que senão faz a regularização
+    "esmagar" contrastes reais em zonas mais profundas/menos resolvidas)."""
     nx, nz = mesh['nx'], mesh['nz']
+    depths_arr = mesh['depths']
     idx_map = -np.ones((nz, nx), dtype=int)
     core_idx = np.where(core_mask.ravel())[0]
     idx_map.ravel()[core_idx] = np.arange(len(core_idx))
 
-    rows = []
     n = len(core_idx)
     Lrows, Lcols, Lvals = [], [], []
     r = 0
@@ -44,19 +48,23 @@ def smoothness_matrix(mesh, core_mask):
             if idx_map[j, i] < 0:
                 continue
             a = idx_map[j, i]
+            d_here = depths_arr[j]
             if i+1 < nx and idx_map[j, i+1] >= 0:
                 b = idx_map[j, i+1]
-                Lrows += [r, r]; Lcols += [a, b]; Lvals += [1.0, -1.0]; r += 1
+                w = 1.0 / (d_here + depth_weight_d0)**depth_weight_power
+                Lrows += [r, r]; Lcols += [a, b]; Lvals += [w, -w]; r += 1
             if j+1 < nz and idx_map[j+1, i] >= 0:
                 b = idx_map[j+1, i]
-                Lrows += [r, r]; Lcols += [a, b]; Lvals += [1.0, -1.0]; r += 1
+                d_avg = 0.5*(depths_arr[j] + depths_arr[j+1])
+                w = 1.0 / (d_avg + depth_weight_d0)**depth_weight_power
+                Lrows += [r, r]; Lcols += [a, b]; Lvals += [w, -w]; r += 1
     import scipy.sparse as sp
     L = sp.csr_matrix((Lvals, (Lrows, Lcols)), shape=(r, n))
     return L
 
 
 def run_inversion(path, n_iter=6, n_k=18, verbose=True, progress_cb=None, sub_per_gap=3, nz_layers=20,
-                   robust=True):
+                   robust=True, depth_weight_power=0.0):
     d, mesh, uniq_x, elec_node_ix = prepare(path, sub_per_gap=sub_per_gap, nz_layers=nz_layers)
     nx, nz = mesh['nx'], mesh['nz']
     readings = d['readings']
@@ -78,7 +86,7 @@ def run_inversion(path, n_iter=6, n_k=18, verbose=True, progress_cb=None, sub_pe
     if verbose:
         print(f"rho0 inicial (mediana obs) = {rho0:.1f} ohm.m")
 
-    L = smoothness_matrix(mesh, core_mask)
+    L = smoothness_matrix(mesh, core_mask, depth_weight_power=depth_weight_power)
     core_idx = np.where(core_mask.ravel())[0]
 
     lam = None  # calibrado dinamicamente na 1a iteracao (escala de J varia MUITO
